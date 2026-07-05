@@ -333,6 +333,25 @@ def should_celebrate(today_key: str) -> bool:
     return not already_celebrated
 
 
+def handle_pending_send_result() -> None:
+    """If a Send just completed on the previous rerun, show its result here.
+
+    Deferred to the *next* rerun (rather than shown immediately at click
+    time) so the confirmation survives the st.rerun() that follows a
+    successful save — the same pattern used for clearing today's entry.
+    """
+    result = st.session_state.pop("_send_result", None)
+    if result is None:
+        return
+    if result["ok"]:
+        st.toast(f"Sent to Excel · {result['at']}", icon="💾")
+        if result["perfect_day"] and should_celebrate(result["today_key"]):
+            st.balloons()
+            st.toast("Perfect day — 100% XP!", icon="🔥")
+    else:
+        st.error(f"Send failed: {result['error']}")
+
+
 def row_unchanged_since_last_save(row: dict) -> bool:
     """True if `row` is identical to what we saved on the previous rerun.
 
@@ -496,7 +515,7 @@ st.markdown(
 with st.sidebar:
     st.markdown("#### ⚙ Settings")
     log_path = st.text_input("Excel log file path", value=DEFAULT_LOG_PATH, label_visibility="collapsed")
-    st.caption("Every change auto-saves here — no button needed.")
+    st.caption("Nothing saves until you press **Send** at the bottom of the page.")
     if os.path.exists(log_path):
         st.success(f"Log found · {os.path.getsize(log_path) / 1024:.1f} KB", icon="📗")
     else:
@@ -513,6 +532,7 @@ day_of_year = today.timetuple().tm_yday
 life_title, life_body, lesson_title, lesson_body = INTEL[day_of_year % len(INTEL)]
 
 handle_pending_clear(log_path, today_key)
+handle_pending_send_result()
 
 existing_df = load_log(log_path)
 prefill_rows = existing_df[existing_df["Date"] == today_key]
@@ -613,13 +633,19 @@ with tab_intel:
 # one interaction behind.
 # =============================================================================
 
+# =============================================================================
+# XP, streak, and the pending row — computed live from this run's widget
+# values. Nothing is written to disk here; saving only happens when the
+# Send button at the bottom of the page is clicked.
+# =============================================================================
+
 xp = sum([workout_done, target_1, target_2, target_3, gratitude_done]) * 20
 tier_label = "Sovereign Sage" if xp >= 100 else "Warrior-Scholar" if xp >= 40 else "The Seeker"
 tier_class = "sage" if xp >= 100 else ""
 
 current_streak, best_streak = compute_streak(existing_df, today_key, xp)
 
-row = {
+pending_row = {
     "Date": today_key,
     "Weekday": today.strftime("%A"),
     "Workout Split": split_title,
@@ -634,24 +660,12 @@ row = {
     "Daily XP %": xp,
     "Streak": current_streak,
 }
-
-sync_message = None
-if not row_unchanged_since_last_save(row):
-    try:
-        save_entry(log_path, row)
-        st.session_state["_last_saved_row"] = row
-        sync_message = f"Synced to Excel · {dt.datetime.now().strftime('%H:%M:%S')}"
-        if xp >= 100 and should_celebrate(today_key):
-            st.balloons()
-            st.toast("Perfect day — 100% XP!", icon="🔥")
-    except Exception as exc:
-        with st.sidebar:
-            st.error(f"Auto-save failed: {exc}")
+has_unsaved_changes = not row_unchanged_since_last_save(pending_row)
 
 with tab_stats:
     log_df = load_log(log_path)
     if log_df.empty:
-        st.info("No entries yet — your first save will appear here automatically.")
+        st.info("No entries yet — click Send at the bottom of the page to save your first entry.")
     else:
         with st.container(border=True):
             total_project = pd.to_numeric(log_df["Project Hours"], errors="coerce").sum()
@@ -661,6 +675,8 @@ with tab_stats:
             cc2.metric("Project hrs", f"{total_project:.1f}")
             cc3.metric("Study hrs", f"{total_study:.1f}")
         st.dataframe(log_df.sort_values("Date", ascending=False), width="stretch", hide_index=True)
+        if has_unsaved_changes:
+            st.caption("⚠ This table reflects your last Send — you have unsaved changes above.")
 
     with st.container(border=True):
         st.markdown("##### 🗓 Day Cycle")
@@ -673,8 +689,8 @@ with tab_stats:
             st.rerun()
 
 # =============================================================================
-# Sidebar — live XP ring, tier, and streak (rendered last so it reflects
-# this run's freshly computed values)
+# Sidebar — live XP ring, tier, and streak (reflects current widget values
+# even before Send is clicked)
 # =============================================================================
 
 with st.sidebar:
@@ -687,8 +703,25 @@ with st.sidebar:
     side_col1, side_col2 = st.columns(2)
     side_col1.metric("Streak", f"{current_streak}d")
     side_col2.metric("Best", f"{best_streak}d")
-    if sync_message:
-        st.markdown(
-            f'<div class="sync-badge"><span class="sync-dot"></span>{sync_message}</div>',
-            unsafe_allow_html=True,
-        )
+    if has_unsaved_changes:
+        st.caption("⚠ Unsaved changes — press Send to write them to Excel.")
+
+# =============================================================================
+# Send — the only action that writes to Excel. Placed at the very bottom
+# of the main page, below every tab.
+# =============================================================================
+
+st.markdown("---")
+if st.button("📤 Send", type="primary", width="stretch"):
+    try:
+        save_entry(log_path, pending_row)
+        st.session_state["_last_saved_row"] = pending_row
+        st.session_state["_send_result"] = {
+            "ok": True,
+            "at": dt.datetime.now().strftime("%H:%M:%S"),
+            "perfect_day": xp >= 100,
+            "today_key": today_key,
+        }
+    except Exception as exc:
+        st.session_state["_send_result"] = {"ok": False, "error": str(exc)}
+    st.rerun()
