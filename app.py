@@ -1,9 +1,9 @@
 """
 FORGE — The Daily Ledger (Streamlit edition)
 Run locally with:  streamlit run app.py
-Every entry is saved to a local Excel workbook (default: forge_log.xlsx,
-same folder as this script). One row per calendar day — saving again on
-the same day updates that row instead of creating duplicates.
+Every entry auto-saves to a local Excel workbook (default: forge_log.xlsx,
+same folder as this script) on every change — no save button needed.
+One row per calendar day — updating today's inputs updates today's row.
 """
 
 import os
@@ -25,7 +25,7 @@ DEFAULT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "for
 COLUMNS = [
     "Date", "Weekday", "Workout Split", "Workout Done",
     "Target 1 - Code/Review", "Target 2 - Deep Work", "Target 3 - Water/Nutrition",
-    "Gratitude Reflected", "Project Hours", "Study/Review Hours",
+    "Gratitude Reflected", "Project Hours", "Study/Review Hours", "Journal",
     "Daily XP %", "Streak",
 ]
 
@@ -143,13 +143,7 @@ def compute_streak(df: pd.DataFrame, today_key: str, today_xp: int) -> tuple[int
     return current, best
 
 
-def save_entry(path: str, row: dict):
-    df = load_log(path)
-    today_key = row["Date"]
-    df = df[df["Date"] != today_key]
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df = df.sort_values("Date").reset_index(drop=True)
-
+def write_workbook(path: str, df: pd.DataFrame):
     wb = Workbook()
     ws = wb.active
     ws.title = "Forge Log"
@@ -167,146 +161,158 @@ def save_entry(path: str, row: dict):
     for _, r in df.iterrows():
         ws.append([r[c] for c in COLUMNS])
 
-    widths = [12, 11, 20, 13, 22, 20, 24, 18, 13, 18, 11, 8]
+    widths = [12, 11, 20, 13, 22, 20, 24, 18, 13, 18, 34, 11, 8]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     for row_cells in ws.iter_rows(min_row=2, max_row=ws.max_row):
         for cell in row_cells:
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     ws.freeze_panes = "A2"
     wb.save(path)
+
+
+def save_entry(path: str, row: dict):
+    df = load_log(path)
+    today_key = row["Date"]
+    df = df[df["Date"] != today_key]
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df = df.sort_values("Date").reset_index(drop=True)
+    write_workbook(path, df)
+    return df
+
+
+def delete_today(path: str, today_key: str):
+    df = load_log(path)
+    df = df[df["Date"] != today_key].reset_index(drop=True)
+    write_workbook(path, df)
     return df
 
 
 # ---------------------------------------------------------------------------
-# Style — minimalist, dark, single accent color, micro-interactions
+# Style — dark minimalist, violet accent, activity ring, micro-interactions
 # ---------------------------------------------------------------------------
 def inject_style():
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 
         :root{
-            --ink:#0c0e13; --card:#14161e; --card-hi:#1a1d28;
-            --text:#eef1f7; --muted:#8991a6; --line:rgba(255,255,255,.07);
-            --accent:#ff8a3d; --accent-soft:rgba(255,138,61,.12);
-            --ok:#3fdb98; --ok-soft:rgba(63,219,152,.12);
+            --ink:#0a0a0d; --card:#151519; --card-hi:#1c1c22;
+            --text:#f5f5f7; --muted:#93939e; --line:rgba(255,255,255,.08);
+            --accent:#7c6cf0; --accent-2:#c26cf0; --accent-soft:rgba(124,108,240,.14);
+            --ok:#34d399; --ok-soft:rgba(52,211,153,.14);
         }
 
         html, body, [class*="css"] { font-family:'Inter',sans-serif; }
-        .stApp { background:
-            radial-gradient(900px 420px at 50% -10%, rgba(255,138,61,.08), transparent 60%),
-            var(--ink);
-            color:var(--text);
-        }
-        h1,h2,h3,h4 { font-family:'Space Grotesk',sans-serif !important; letter-spacing:.01em; }
+        .stApp { background:var(--ink); color:var(--text); }
+        h1,h2,h3,h4 { font-family:'Manrope',sans-serif !important; letter-spacing:-.01em; }
 
-        /* Hide default chrome for a cleaner look */
         #MainMenu, footer, header[data-testid="stHeader"] { background:transparent; }
-        .block-container { padding-top:1.6rem; padding-bottom:3rem; max-width:640px; }
+        .block-container { padding-top:1.4rem; padding-bottom:3rem; max-width:640px; }
 
-        /* Hero */
-        .hero { text-align:center; margin-bottom:.2rem; animation:fadeDown .5s ease; }
-        .hero .mark { font-size:2.6rem; font-weight:700; letter-spacing:.03em; line-height:1; }
+        .hero { text-align:center; margin-bottom:1rem; animation:fadeDown .5s ease; }
+        .hero .mark { font-size:2.2rem; font-weight:800; letter-spacing:-.02em; line-height:1; }
         .hero .mark span{ color:var(--accent); }
-        .hero .tag { font-family:'JetBrains Mono',monospace; font-size:.68rem; letter-spacing:.35em;
+        .hero .tag { font-family:'JetBrains Mono',monospace; font-size:.65rem; letter-spacing:.3em;
                      color:var(--muted); text-transform:uppercase; margin-top:.3rem; }
         @keyframes fadeDown{ from{opacity:0; transform:translateY(-8px);} to{opacity:1; transform:none;} }
 
-        /* Bordered containers -> minimalist cards with hover lift */
         div[data-testid="stVerticalBlockBorderWrapper"]{
-            background:var(--card) !important;
-            border:1px solid var(--line) !important;
-            border-radius:14px !important;
-            transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+            background:var(--card) !important; border:1px solid var(--line) !important;
+            border-radius:16px !important; transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease;
             animation:rise .45s ease backwards;
         }
         div[data-testid="stVerticalBlockBorderWrapper"]:hover{
-            border-color:rgba(255,138,61,.35) !important;
-            box-shadow:0 6px 24px rgba(0,0,0,.28);
+            border-color:rgba(124,108,240,.35) !important; box-shadow:0 6px 24px rgba(0,0,0,.28);
         }
         @keyframes rise{ from{opacity:0; transform:translateY(10px);} to{opacity:1; transform:none;} }
 
-        /* Tabs — pill-style, satisfying active state */
         div[data-testid="stTabs"] button[role="tab"]{
-            font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:.86rem;
-            border-radius:999px !important; padding:.4rem 1rem !important;
-            transition:all .18s ease; color:var(--muted);
+            font-family:'Manrope',sans-serif; font-weight:700; font-size:.85rem;
+            border-radius:999px !important; padding:.4rem 1rem !important; transition:all .18s ease; color:var(--muted);
         }
         div[data-testid="stTabs"] button[role="tab"]:hover{ color:var(--text); background:var(--card-hi); }
-        div[data-testid="stTabs"] button[aria-selected="true"]{
-            color:#1a0f06 !important; background:var(--accent) !important;
-        }
+        div[data-testid="stTabs"] button[aria-selected="true"]{ color:#fff !important; background:var(--accent) !important; }
         div[data-testid="stTabs"] [data-baseweb="tab-highlight"]{ display:none; }
         div[data-testid="stTabs"] [data-baseweb="tab-border"]{ background:transparent; }
 
-        /* Checkboxes: subtle hover + satisfying check state */
-        label[data-testid="stCheckbox"]{
-            transition:transform .12s ease;
-        }
+        label[data-testid="stCheckbox"]{ transition:transform .12s ease; }
         label[data-testid="stCheckbox"]:hover{ transform:translateX(2px); }
-        label[data-testid="stCheckbox"] span[data-testid="stMarkdownContainer"]{
-            transition:color .15s ease;
-        }
 
-        /* Buttons */
-        div[data-testid="stButton"] button, div[data-testid="stFormSubmitButton"] button{
-            border-radius:11px !important; font-weight:600 !important;
-            transition:transform .1s ease, box-shadow .18s ease !important;
-            border:1px solid var(--line) !important;
+        div[data-testid="stButton"] button{
+            border-radius:11px !important; font-weight:700 !important;
+            transition:transform .1s ease, box-shadow .18s ease !important; border:1px solid var(--line) !important;
         }
-        div[data-testid="stButton"] button:hover{ transform:translateY(-1px); box-shadow:0 6px 18px rgba(255,138,61,.18); }
+        div[data-testid="stButton"] button:hover{ transform:translateY(-1px); box-shadow:0 6px 18px rgba(124,108,240,.18); }
         div[data-testid="stButton"] button:active{ transform:translateY(0) scale(.98); }
-        div[data-testid="stButton"] button[kind="primary"]{
-            background:var(--accent) !important; color:#1a0f06 !important; border:none !important;
-        }
 
-        /* Metrics */
         div[data-testid="stMetric"]{
             background:var(--card-hi); border:1px solid var(--line); border-radius:12px;
             padding:.7rem .9rem; transition:transform .15s ease;
         }
         div[data-testid="stMetric"]:hover{ transform:translateY(-2px); }
         div[data-testid="stMetricLabel"]{ font-family:'JetBrains Mono',monospace; text-transform:uppercase;
-            font-size:.66rem !important; letter-spacing:.14em; color:var(--muted) !important; }
+            font-size:.64rem !important; letter-spacing:.14em; color:var(--muted) !important; }
 
-        /* Progress bar */
-        div[data-testid="stProgress"] > div > div{
-            background:linear-gradient(90deg,#c96a1e,var(--accent)) !important;
-            border-radius:999px !important; transition:width .5s cubic-bezier(.22,1,.36,1);
-        }
-        div[data-testid="stProgress"] > div{ background:var(--card-hi) !important; border-radius:999px !important; height:10px !important; }
-
-        /* Number inputs */
-        div[data-testid="stNumberInput"] input{
+        div[data-testid="stNumberInput"] input, div[data-testid="stTextArea"] textarea{
             border-radius:10px !important; background:var(--card-hi) !important; border:1px solid var(--line) !important;
         }
 
-        /* Sidebar */
         section[data-testid="stSidebar"]{ background:var(--card) !important; border-right:1px solid var(--line); }
-
-        /* Divider replacement spacing */
         hr{ border-color:var(--line) !important; margin:1.1rem 0 !important; }
 
-        /* Quote block */
-        .quote-card{ font-family:'Space Grotesk',sans-serif; font-size:1.08rem; font-weight:500;
-                     line-height:1.5; padding:.2rem 0 .1rem; }
+        .quote-card{ font-family:'Manrope',sans-serif; font-size:1.05rem; font-weight:700; line-height:1.5; padding:.2rem 0 .1rem; }
         .quote-card .q::before{ content:"“"; color:var(--accent); font-size:1.4rem; }
-        .quote-author{ font-family:'JetBrains Mono',monospace; font-size:.78rem; color:var(--muted); margin-top:.2rem; }
+        .quote-author{ font-family:'JetBrains Mono',monospace; font-size:.76rem; color:var(--muted); margin-top:.2rem; }
 
         .tier-chip{
-            display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.72rem; font-weight:600;
+            display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.7rem; font-weight:700;
             letter-spacing:.1em; text-transform:uppercase; padding:.3rem .7rem; border-radius:999px;
-            background:var(--accent-soft); color:var(--accent); border:1px solid rgba(255,138,61,.3);
+            background:var(--accent-soft); color:var(--accent); border:1px solid rgba(124,108,240,.3);
         }
-        .tier-chip.sage{ background:var(--ok-soft); color:var(--ok); border-color:rgba(63,219,152,.3); }
+        .tier-chip.sage{ background:var(--ok-soft); color:var(--ok); border-color:rgba(52,211,153,.3); }
+
+        .sync-badge{
+            display:flex; align-items:center; gap:7px; font-family:'JetBrains Mono',monospace; font-size:.72rem;
+            color:var(--ok); background:var(--ok-soft); border:1px solid rgba(52,211,153,.3);
+            border-radius:10px; padding:.5rem .7rem; margin-top:.6rem;
+        }
+        .sync-dot{ width:7px; height:7px; border-radius:50%; background:var(--ok); flex:none;
+            animation:pulse 1.6s ease-in-out infinite; }
+        @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.4} }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def ring_svg(pct: int, size: int = 88) -> str:
+    r = 38
+    circumference = 2 * 3.14159265 * r
+    offset = circumference - (pct / 100) * circumference
+    return f"""
+    <div style="position:relative;width:{size}px;height:{size}px;flex:none;">
+      <svg viewBox="0 0 88 88" width="{size}" height="{size}" style="transform:rotate(-90deg);">
+        <defs>
+          <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#7c6cf0"/>
+            <stop offset="100%" stop-color="#c26cf0"/>
+          </linearGradient>
+        </defs>
+        <circle cx="44" cy="44" r="{r}" fill="none" stroke="#1c1c22" stroke-width="9"/>
+        <circle cx="44" cy="44" r="{r}" fill="none" stroke="url(#ringGrad)" stroke-width="9"
+                stroke-linecap="round" stroke-dasharray="{circumference:.2f}" stroke-dashoffset="{offset:.2f}"
+                style="transition:stroke-dashoffset .6s cubic-bezier(.22,1,.36,1);"/>
+      </svg>
+      <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+        <div style="font-family:'Manrope',sans-serif;font-weight:800;font-size:19px;color:#f5f5f7;">{pct}%</div>
+        <div style="font-size:9px;color:#5c5c66;letter-spacing:.08em;text-transform:uppercase;margin-top:-2px;">XP</div>
+      </div>
+    </div>
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -327,14 +333,11 @@ st.markdown(
 with st.sidebar:
     st.markdown("#### ⚙ Settings")
     log_path = st.text_input("Excel log file path", value=DEFAULT_LOG_PATH, label_visibility="collapsed")
-    st.caption("Local file this app reads and writes.")
+    st.caption("Every change auto-saves here — no button needed.")
     if os.path.exists(log_path):
         st.success(f"Log found · {os.path.getsize(log_path)/1024:.1f} KB", icon="📗")
     else:
-        st.info("No log yet — created on first save.", icon="📄")
-
-    st.markdown("---")
-    st.markdown("#### 📊 Live Status")
+        st.info("No log yet — created on your first change.", icon="📄")
 
 today = dt.date.today()
 today_key = today.isoformat()
@@ -344,44 +347,63 @@ day_of_year = today.timetuple().tm_yday
 quote, author, lesson_title, lesson_body = INTEL[day_of_year % len(INTEL)]
 
 existing_df = load_log(log_path)
+
+if st.session_state.get("_clear_today"):
+    st.session_state["_clear_today"] = False
+    delete_today(log_path, today_key)
+    st.session_state["reset_gen"] = st.session_state.get("reset_gen", 0) + 1
+    existing_df = load_log(log_path)
+
+reset_gen = st.session_state.get("reset_gen", 0)
+wkey = lambda name: f"{name}_{today_key}_{reset_gen}"
+
 existing_today = existing_df[existing_df["Date"] == today_key]
 prefill = existing_today.iloc[0].to_dict() if not existing_today.empty else {}
 
 st.caption(f"📅 {today.strftime('%A, %B %d, %Y')}")
 
-tab_today, tab_time, tab_intel, tab_history = st.tabs(["🏠 Today", "⏱ Time & Reflection", "🧠 Intel", "📖 History"])
+tab_today, tab_journal, tab_intel, tab_stats = st.tabs(["🏠 Today", "✍ Journal", "🧠 Intel", "📊 Stats"])
 
 with tab_today:
     with st.container(border=True):
         st.markdown("##### ⚒ Today's Iron")
         st.markdown(f"**{split_title}**")
         st.caption(split_detail)
-        workout_done = st.checkbox("Mark today's session complete", value=bool(prefill.get("Workout Done", False)))
+        workout_done = st.checkbox("Mark today's session complete", value=bool(prefill.get("Workout Done", False)), key=wkey("workout_done"))
 
     with st.container(border=True):
         st.markdown("##### 🎯 Rule of Three")
-        t1 = st.checkbox("Code / review pipeline architecture layouts", value=bool(prefill.get("Target 1 - Code/Review", False)))
-        t2 = st.checkbox("Deep work window (no distractions)", value=bool(prefill.get("Target 2 - Deep Work", False)))
-        t3 = st.checkbox("Drink 4L of water & clean nutrition", value=bool(prefill.get("Target 3 - Water/Nutrition", False)))
+        t1 = st.checkbox("Code / review pipeline architecture layouts", value=bool(prefill.get("Target 1 - Code/Review", False)), key=wkey("t1"))
+        t2 = st.checkbox("Deep work window (no distractions)", value=bool(prefill.get("Target 2 - Deep Work", False)), key=wkey("t2"))
+        t3 = st.checkbox("Drink 4L of water & clean nutrition", value=bool(prefill.get("Target 3 - Water/Nutrition", False)), key=wkey("t3"))
 
-with tab_time:
+    with st.container(border=True):
+        st.markdown("##### ✦ Nightly Reflection")
+        gratitude = st.checkbox("I've thought of 3 things I'm grateful for", value=bool(prefill.get("Gratitude Reflected", False)), key=wkey("gratitude"))
+
+with tab_journal:
     with st.container(border=True):
         st.markdown("##### ⏱ Time Ledger")
         col1, col2 = st.columns(2)
         with col1:
             project_hours = st.number_input(
                 "Project hours", min_value=0.0, max_value=24.0, step=0.25,
-                value=float(prefill.get("Project Hours", 0.0) or 0.0),
+                value=float(prefill.get("Project Hours", 0.0) or 0.0), key=wkey("project_hours"),
             )
         with col2:
             study_hours = st.number_input(
                 "Study / review hours", min_value=0.0, max_value=24.0, step=0.25,
-                value=float(prefill.get("Study/Review Hours", 0.0) or 0.0),
+                value=float(prefill.get("Study/Review Hours", 0.0) or 0.0), key=wkey("study_hours"),
             )
 
     with st.container(border=True):
-        st.markdown("##### ✦ Nightly Reflection")
-        gratitude = st.checkbox("I've thought of 3 things I'm grateful for", value=bool(prefill.get("Gratitude Reflected", False)))
+        st.markdown("##### 📝 What did you do today?")
+        journal = st.text_area(
+            "Journal", value=str(prefill.get("Journal", "") or ""), height=110,
+            placeholder="Shipped the ingestion retry logic, reviewed two PRs, read a chapter on vector indexing…",
+            label_visibility="collapsed", max_chars=600, key=wkey("journal"),
+        )
+        st.caption(f"{len(journal)} / 600")
 
 with tab_intel:
     with st.container(border=True):
@@ -392,10 +414,10 @@ with tab_intel:
         st.markdown(f"**{lesson_title}**")
         st.caption(lesson_body)
 
-with tab_history:
+with tab_stats:
     df_display = load_log(log_path)
     if df_display.empty:
-        st.info("No entries yet — save today's first to start your history.")
+        st.info("No entries yet — your first save will appear here automatically.")
     else:
         with st.container(border=True):
             total_project = pd.to_numeric(df_display["Project Hours"], errors="coerce").sum()
@@ -404,9 +426,19 @@ with tab_history:
             cc1.metric("Days logged", len(df_display))
             cc2.metric("Project hrs", f"{total_project:.1f}")
             cc3.metric("Study hrs", f"{total_study:.1f}")
-        st.dataframe(df_display.sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(df_display.sort_values("Date", ascending=False), width='stretch', hide_index=True)
 
-# ---- XP + streak (computed from whichever tab values were rendered) ----
+    with st.container(border=True):
+        st.markdown("##### 🗓 Day Cycle")
+        st.caption(
+            "Each calendar day gets its own row automatically — tomorrow starts blank "
+            "with no action needed. Use this only if you want to wipe *today's* entry and start over."
+        )
+        if st.button("🗑 Clear today's entry", width='stretch'):
+            st.session_state["_clear_today"] = True
+            st.rerun()
+
+# ---- XP + streak ----
 tokens = [workout_done, t1, t2, t3, gratitude]
 xp = sum(tokens) * 20
 tier_label = "Sovereign Sage" if xp >= 100 else ("Warrior-Scholar" if xp >= 40 else "The Seeker")
@@ -415,16 +447,14 @@ tier_class = "sage" if xp >= 100 else ""
 current_streak, best_streak = compute_streak(existing_df, today_key, xp)
 
 with st.sidebar:
-    st.markdown(f'<span class="tier-chip {tier_class}">{tier_label}</span>', unsafe_allow_html=True)
-    st.write("")
-    s1, s2 = st.columns(2)
-    s1.metric("XP", f"{xp}%")
-    s2.metric("Streak", f"{current_streak}d")
-    st.progress(xp / 100)
-
     st.markdown("---")
-    save_clicked = st.button("💾  Save Today's Entry", type="primary", use_container_width=True)
+    st.markdown(ring_svg(xp), unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:center;margin-top:8px;"><span class="tier-chip {tier_class}">{tier_label}</span></div>', unsafe_allow_html=True)
+    s1, s2 = st.columns(2)
+    s1.metric("Streak", f"{current_streak}d")
+    s2.metric("Best", f"{best_streak}d")
 
+# ---- Auto-save on every rerun (no button — feels like a live database) ----
 row = {
     "Date": today_key,
     "Weekday": today.strftime("%A"),
@@ -436,15 +466,26 @@ row = {
     "Gratitude Reflected": gratitude,
     "Project Hours": project_hours,
     "Study/Review Hours": study_hours,
+    "Journal": journal,
     "Daily XP %": xp,
     "Streak": current_streak,
 }
 
-if save_clicked:
-    try:
-        save_entry(log_path, row)
-        st.toast("Entry saved to your local Excel log ✓", icon="💾")
-        if xp >= 100:
-            st.balloons()
-    except Exception as e:
-        st.toast(f"Save failed: {e}", icon="⚠️")
+try:
+    save_entry(log_path, row)
+    with st.sidebar:
+        st.markdown(
+            f'<div class="sync-badge"><span class="sync-dot"></span>Synced to Excel · {dt.datetime.now().strftime("%H:%M:%S")}</div>',
+            unsafe_allow_html=True,
+        )
+    if xp >= 100 and not st.session_state.get("_celebrated_today") == today_key:
+        st.session_state["_celebrated_today"] = today_key
+        st.balloons()
+        st.toast("Perfect day — 100% XP!", icon="🔥")
+except Exception as e:
+    with st.sidebar:
+        st.error(f"Auto-save failed: {e}")
+
+if st.session_state.get("_force_reset"):
+    st.session_state["_force_reset"] = False
+    st.toast("Day committed. Streak updates on your next perfect day.", icon="✅")
