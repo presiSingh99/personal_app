@@ -1,26 +1,33 @@
 """
 FORGE — The Daily Ledger (Streamlit edition)
-Run locally with:  streamlit run app.py
+
+Run locally with:   streamlit run app.py
+
 Every entry auto-saves to a local Excel workbook (default: forge_log.xlsx,
-same folder as this script) on every change — no save button needed.
-One row per calendar day — updating today's inputs updates today's row.
+in the same folder as this script) as soon as anything changes — there is
+no save button. Each calendar day is one row, written to a dedicated
+"Forge Log" sheet; any other sheets already present in the target workbook
+are left untouched.
 """
 
-import os
+from __future__ import annotations
+
 import datetime as dt
+import os
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="Forge — Daily Ledger", page_icon="⚒", layout="centered")
+# =============================================================================
+# Constants
+# =============================================================================
 
 DEFAULT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forge_log.xlsx")
+SHEET_NAME = "Forge Log"
 
 COLUMNS = [
     "Date", "Weekday", "Workout Split", "Workout Done",
@@ -29,6 +36,10 @@ COLUMNS = [
     "Daily XP %", "Streak",
 ]
 
+# Column widths for the exported worksheet, matched 1:1 to COLUMNS above.
+COLUMN_WIDTHS = [12, 11, 20, 13, 22, 20, 24, 18, 13, 18, 34, 11, 8]
+
+# Weekly workout blueprint, keyed by Python's date.weekday() (Mon=0 ... Sun=6).
 SPLITS = {
     0: ("Active Recovery", "Incline walk 30-45min, mobility, structural rest"),
     1: ("Back Focus", "Lat Pulldown 4x10, Seated Cable Row 4x10, Chest Supported Row 3x10, Single Arm DB Row 3x10, Face Pulls 3x15, Shrugs 3x12"),
@@ -38,8 +49,10 @@ SPLITS = {
     5: ("Arms & Shoulder Caps", "EZ Bar Curl 4x10, Hammer Curl 3x12, Preacher Curl 3x12, Rope Pushdown 4x12, Overhead Tricep Ext 3x12, Lateral Raises 5x15, Rear Delt Flys 3x15"),
     6: ("Active Recovery", "Incline walk 30-45min, mobility, structural rest"),
 }
-SPLIT_BY_PY_WEEKDAY = {0: SPLITS[1], 1: SPLITS[2], 2: SPLITS[3], 3: SPLITS[4], 4: SPLITS[5], 5: SPLITS[6], 6: SPLITS[0]}
+SPLIT_BY_WEEKDAY = {0: SPLITS[1], 1: SPLITS[2], 2: SPLITS[3], 3: SPLITS[4], 4: SPLITS[5], 5: SPLITS[6], 6: SPLITS[0]}
 
+# Rotating pool of (life_title, life_body, lesson_title, lesson_body) tuples,
+# one shown per day of the year via INTEL[day_of_year % len(INTEL)].
 INTEL = [
     ("Control the input, not the outcome", "The only things fully in your hands each day are your effort, your attention, and your reactions — not results, not other people, not the market. Before you start work, write down one input you fully control today (hours of deep focus, one hard conversation you'll have, one rep you'll add) and judge the day by whether you did that, not by whether the outcome landed. This single reframe removes most anxiety, because anxiety lives in the gap between 'I want X to happen' and 'X is not up to me.' Practice it by ending each day naming the input you controlled well, regardless of the result.",
      "Idempotency",
@@ -138,103 +151,206 @@ INTEL = [
      "Backups that have never actually been restored are only a theory of safety, not real safety, since the restore process itself often has its own undiscovered bugs that only surface when you desperately need it to work. Define two concrete numbers before an incident ever happens: your Recovery Point Objective (how much data loss is acceptable, e.g., the last hour) and your Recovery Time Objective (how long you can be down, e.g., 30 minutes) — then build and test a restore process against those actual targets. Table-format time-travel features (like those in Delta Lake or Iceberg) are excellent for undoing an accidental bad write, but they are not a substitute for real disaster recovery against a lost or corrupted underlying storage system — rehearse a full restore on a schedule, not just when you're desperate."),
 ]
 
-
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Excel persistence
-# ---------------------------------------------------------------------------
+# =============================================================================
+
 def load_log(path: str) -> pd.DataFrame:
-    if os.path.exists(path):
-        try:
-            df = pd.read_excel(path, dtype={"Date": str})
-            for col in COLUMNS:
-                if col not in df.columns:
-                    df[col] = None
-            return df[COLUMNS]
-        except Exception as e:
-            st.error(f"Could not read existing log ({e}). A fresh one will be created on save.")
-    return pd.DataFrame(columns=COLUMNS)
+    """Load the Forge Log sheet as a DataFrame with all COLUMNS present.
+
+    Returns an empty (but correctly-shaped) DataFrame if the file doesn't
+    exist yet, or if it exists but has no Forge Log sheet yet (e.g. the
+    first time this is pointed at an existing personal workbook).
+    """
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=COLUMNS)
+
+    try:
+        df = pd.read_excel(path, sheet_name=SHEET_NAME, dtype={"Date": str})
+    except ValueError:
+        return pd.DataFrame(columns=COLUMNS)
+    except Exception as exc:
+        st.error(f"Could not read existing log ({exc}). A fresh sheet will be created on save.")
+        return pd.DataFrame(columns=COLUMNS)
+
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[COLUMNS]
 
 
-def compute_streak(df: pd.DataFrame, today_key: str, today_xp: int) -> tuple[int, int]:
-    hist = df[df["Date"] != today_key].copy()
-    hist = hist.sort_values("Date")
-    xp_by_date = dict(zip(hist["Date"], hist["Daily XP %"]))
+def compute_streak(history: pd.DataFrame, today_key: str, today_xp: int) -> tuple[int, int]:
+    """Compute (current_streak, best_streak) in days, treating `today_xp` as
+    today's live value regardless of what (if anything) is already saved
+    for today in `history`.
+    """
+    past = history[history["Date"] != today_key]
+    xp_by_date = dict(zip(past["Date"], past["Daily XP %"]))
     xp_by_date[today_key] = today_xp
 
-    dates_sorted = sorted(xp_by_date.keys())
-    streaks, run = [], 0
-    for d in dates_sorted:
-        if xp_by_date.get(d, 0) >= 100:
-            run += 1
+    dates_sorted = sorted(xp_by_date)
+    runs, current_run = [], 0
+    for date_key in dates_sorted:
+        if xp_by_date.get(date_key, 0) >= 100:
+            current_run += 1
         else:
-            if run:
-                streaks.append(run)
-            run = 0
-    if run:
-        streaks.append(run)
+            if current_run:
+                runs.append(current_run)
+            current_run = 0
+    if current_run:
+        runs.append(current_run)
 
-    current = 0
-    for d in reversed(dates_sorted):
-        if xp_by_date.get(d, 0) >= 100:
-            current += 1
+    # The "current" streak is the run ending at the most recent date, if any.
+    current_streak = 0
+    for date_key in reversed(dates_sorted):
+        if xp_by_date.get(date_key, 0) >= 100:
+            current_streak += 1
         else:
             break
-    best = max(streaks) if streaks else 0
-    best = max(best, current)
-    return current, best
+
+    best_streak = max(runs, default=0)
+    best_streak = max(best_streak, current_streak)
+    return current_streak, best_streak
 
 
-def write_workbook(path: str, df: pd.DataFrame):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Forge Log"
+def _write_workbook_atomic(path: str, df: pd.DataFrame) -> None:
+    """Render `df` into the Forge Log sheet of the workbook at `path` and
+    save it safely.
+
+    Any other sheets already in the target file are preserved untouched.
+    The workbook is built entirely in memory (BytesIO) and only written to
+    disk as a single atomic replace, so a crash or interruption mid-write
+    can never leave a corrupted or half-written Excel file behind.
+    """
+    if os.path.exists(path):
+        try:
+            workbook = load_workbook(path)
+        except Exception:
+            workbook = Workbook()
+            workbook.remove(workbook.active)
+    else:
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+
+    if SHEET_NAME in workbook.sheetnames:
+        sheet_index = workbook.sheetnames.index(SHEET_NAME)
+        del workbook[SHEET_NAME]
+        sheet = workbook.create_sheet(SHEET_NAME, sheet_index)
+    else:
+        sheet = workbook.create_sheet(SHEET_NAME)
 
     header_font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill("solid", start_color="20242E", end_color="20242E")
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    centered = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    ws.append(COLUMNS)
-    for cell in ws[1]:
+    sheet.append(COLUMNS)
+    for cell in sheet[1]:
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = center
+        cell.alignment = centered
 
-    for _, r in df.iterrows():
-        ws.append([r[c] for c in COLUMNS])
+    for _, row in df.iterrows():
+        sheet.append([row[col] for col in COLUMNS])
 
-    widths = [12, 11, 20, 13, 22, 20, 24, 18, 13, 18, 34, 11, 8]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+    for i, width in enumerate(COLUMN_WIDTHS, start=1):
+        sheet.column_dimensions[get_column_letter(i)].width = width
 
-    for row_cells in ws.iter_rows(min_row=2, max_row=ws.max_row):
+    for row_cells in sheet.iter_rows(min_row=2, max_row=sheet.max_row):
         for cell in row_cells:
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.alignment = centered
 
-    ws.freeze_panes = "A2"
-    wb.save(path)
+    sheet.freeze_panes = "A2"
+
+    # Build fully in memory first, then flush to disk as one atomic operation.
+    buffer = BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(buffer.getbuffer())
+    os.replace(tmp_path, path)  # atomic on the same filesystem
 
 
-def save_entry(path: str, row: dict):
+def save_entry(path: str, row: dict) -> pd.DataFrame:
+    """Upsert `row` into the log at `path`, keyed by row['Date'], and
+    persist it. Returns the resulting full DataFrame.
+    """
     df = load_log(path)
-    today_key = row["Date"]
-    df = df[df["Date"] != today_key]
+    df = df[df["Date"] != row["Date"]]
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df = df.sort_values("Date").reset_index(drop=True)
-    write_workbook(path, df)
+    _write_workbook_atomic(path, df)
     return df
 
 
-def delete_today(path: str, today_key: str):
+def delete_today(path: str, today_key: str) -> pd.DataFrame:
+    """Remove today's row (if any) from the log at `path` and persist it."""
     df = load_log(path)
     df = df[df["Date"] != today_key].reset_index(drop=True)
-    write_workbook(path, df)
+    _write_workbook_atomic(path, df)
     return df
 
 
-# ---------------------------------------------------------------------------
-# Style — dark minimalist, violet accent, activity ring, micro-interactions
-# ---------------------------------------------------------------------------
-def inject_style():
+# =============================================================================
+# Streamlit session-state helpers
+# =============================================================================
+#
+# Widget keys are namespaced by (today's date, a "reset generation" counter).
+# This does two things:
+#   1. Each new calendar day naturally gets fresh, blank widgets, since the
+#      date changes and Streamlit treats a new key as a brand-new widget.
+#   2. "Clear today's entry" can force the same effect mid-session by
+#      bumping the reset generation, which changes every key without
+#      needing to touch each widget's stored value directly.
+
+def widget_key(name: str, today_key: str) -> str:
+    """Build a widget key namespaced by date and reset generation."""
+    reset_gen = st.session_state.get("reset_gen", 0)
+    return f"{name}_{today_key}_{reset_gen}"
+
+
+def request_clear_today() -> None:
+    """Flag that today's entry should be wiped on the next rerun."""
+    st.session_state["_clear_today"] = True
+
+
+def handle_pending_clear(path: str, today_key: str) -> None:
+    """If a clear was requested, delete today's row and bump the reset
+    generation so widgets re-render blank. No-op otherwise.
+    """
+    if st.session_state.get("_clear_today"):
+        st.session_state["_clear_today"] = False
+        delete_today(path, today_key)
+        st.session_state["reset_gen"] = st.session_state.get("reset_gen", 0) + 1
+
+
+def should_celebrate(today_key: str) -> bool:
+    """True at most once per day — the first time XP reaches 100% today."""
+    already_celebrated = st.session_state.get("_celebrated_on") == today_key
+    if not already_celebrated:
+        st.session_state["_celebrated_on"] = today_key
+    return not already_celebrated
+
+
+def row_unchanged_since_last_save(row: dict) -> bool:
+    """True if `row` is identical to what we saved on the previous rerun.
+
+    Streamlit reruns the whole script on every widget interaction, but not
+    every rerun changes anything worth writing to disk (e.g. typing in the
+    sidebar's log-path field). Skipping redundant saves avoids needless
+    disk I/O without changing any user-visible behavior.
+    """
+    last_saved = st.session_state.get("_last_saved_row")
+    return last_saved == row
+
+
+# =============================================================================
+# Style — dark minimalist theme, violet accent, activity ring, micro-interactions
+# =============================================================================
+
+def inject_style() -> None:
+    """Inject the app's custom CSS once per run."""
     st.markdown(
         """
         <style>
@@ -306,7 +422,6 @@ def inject_style():
         hr{ border-color:var(--line) !important; margin:1.1rem 0 !important; }
 
         .quote-card{ font-family:'Manrope',sans-serif; font-size:1.05rem; font-weight:700; line-height:1.5; padding:.2rem 0 .1rem; }
-        .quote-card .q::before{ content:"“"; color:var(--accent); font-size:1.4rem; }
         .quote-author{ font-family:'JetBrains Mono',monospace; font-size:.76rem; color:var(--muted); margin-top:.2rem; }
 
         .tier-chip{
@@ -331,8 +446,9 @@ def inject_style():
 
 
 def ring_svg(pct: int, size: int = 88) -> str:
-    r = 38
-    circumference = 2 * 3.14159265 * r
+    """Return an inline SVG activity ring showing `pct` (0-100) as XP."""
+    radius = 38
+    circumference = 2 * 3.14159265 * radius
     offset = circumference - (pct / 100) * circumference
     return f"""
     <div style="position:relative;width:{size}px;height:{size}px;flex:none;">
@@ -343,8 +459,8 @@ def ring_svg(pct: int, size: int = 88) -> str:
             <stop offset="100%" stop-color="#c26cf0"/>
           </linearGradient>
         </defs>
-        <circle cx="44" cy="44" r="{r}" fill="none" stroke="#1c1c22" stroke-width="9"/>
-        <circle cx="44" cy="44" r="{r}" fill="none" stroke="url(#ringGrad)" stroke-width="9"
+        <circle cx="44" cy="44" r="{radius}" fill="none" stroke="#1c1c22" stroke-width="9"/>
+        <circle cx="44" cy="44" r="{radius}" fill="none" stroke="url(#ringGrad)" stroke-width="9"
                 stroke-linecap="round" stroke-dasharray="{circumference:.2f}" stroke-dashoffset="{offset:.2f}"
                 style="transition:stroke-dashoffset .6s cubic-bezier(.22,1,.36,1);"/>
       </svg>
@@ -356,9 +472,11 @@ def ring_svg(pct: int, size: int = 88) -> str:
     """
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Page setup
+# =============================================================================
+
+st.set_page_config(page_title="Forge — Daily Ledger", page_icon="⚒", layout="centered")
 inject_style()
 
 st.markdown(
@@ -371,37 +489,44 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# =============================================================================
+# Sidebar — log file location
+# =============================================================================
+
 with st.sidebar:
     st.markdown("#### ⚙ Settings")
     log_path = st.text_input("Excel log file path", value=DEFAULT_LOG_PATH, label_visibility="collapsed")
     st.caption("Every change auto-saves here — no button needed.")
     if os.path.exists(log_path):
-        st.success(f"Log found · {os.path.getsize(log_path)/1024:.1f} KB", icon="📗")
+        st.success(f"Log found · {os.path.getsize(log_path) / 1024:.1f} KB", icon="📗")
     else:
         st.info("No log yet — created on your first change.", icon="📄")
 
+# =============================================================================
+# Today's context (date, workout split, rotating intel entry)
+# =============================================================================
+
 today = dt.date.today()
 today_key = today.isoformat()
-py_wd = today.weekday()
-split_title, split_detail = SPLIT_BY_PY_WEEKDAY[py_wd]
+split_title, split_detail = SPLIT_BY_WEEKDAY[today.weekday()]
 day_of_year = today.timetuple().tm_yday
 life_title, life_body, lesson_title, lesson_body = INTEL[day_of_year % len(INTEL)]
 
+handle_pending_clear(log_path, today_key)
+
 existing_df = load_log(log_path)
+prefill_rows = existing_df[existing_df["Date"] == today_key]
+prefill = prefill_rows.iloc[0].to_dict() if not prefill_rows.empty else {}
 
-if st.session_state.get("_clear_today"):
-    st.session_state["_clear_today"] = False
-    delete_today(log_path, today_key)
-    st.session_state["reset_gen"] = st.session_state.get("reset_gen", 0) + 1
-    existing_df = load_log(log_path)
-
-reset_gen = st.session_state.get("reset_gen", 0)
-wkey = lambda name: f"{name}_{today_key}_{reset_gen}"
-
-existing_today = existing_df[existing_df["Date"] == today_key]
-prefill = existing_today.iloc[0].to_dict() if not existing_today.empty else {}
+def key(name: str) -> str:
+    """Shorthand for this run's widget_key(name, today_key)."""
+    return widget_key(name, today_key)
 
 st.caption(f"📅 {today.strftime('%A, %B %d, %Y')}")
+
+# =============================================================================
+# Tabs
+# =============================================================================
 
 tab_today, tab_journal, tab_intel, tab_stats = st.tabs(["🏠 Today", "✍ Journal", "🧠 Intel", "📊 Stats"])
 
@@ -410,17 +535,37 @@ with tab_today:
         st.markdown("##### ⚒ Today's Iron")
         st.markdown(f"**{split_title}**")
         st.caption(split_detail)
-        workout_done = st.checkbox("Mark today's session complete", value=bool(prefill.get("Workout Done", False)), key=wkey("workout_done"))
+        workout_done = st.checkbox(
+            "Mark today's session complete",
+            value=bool(prefill.get("Workout Done", False)),
+            key=key("workout_done"),
+        )
 
     with st.container(border=True):
         st.markdown("##### 🎯 Rule of Three")
-        t1 = st.checkbox("Code / review pipeline architecture layouts", value=bool(prefill.get("Target 1 - Code/Review", False)), key=wkey("t1"))
-        t2 = st.checkbox("Deep work window (no distractions)", value=bool(prefill.get("Target 2 - Deep Work", False)), key=wkey("t2"))
-        t3 = st.checkbox("Drink 4L of water & clean nutrition", value=bool(prefill.get("Target 3 - Water/Nutrition", False)), key=wkey("t3"))
+        target_1 = st.checkbox(
+            "Code / review pipeline architecture layouts",
+            value=bool(prefill.get("Target 1 - Code/Review", False)),
+            key=key("target_1"),
+        )
+        target_2 = st.checkbox(
+            "Deep work window (no distractions)",
+            value=bool(prefill.get("Target 2 - Deep Work", False)),
+            key=key("target_2"),
+        )
+        target_3 = st.checkbox(
+            "Drink 4L of water & clean nutrition",
+            value=bool(prefill.get("Target 3 - Water/Nutrition", False)),
+            key=key("target_3"),
+        )
 
     with st.container(border=True):
         st.markdown("##### ✦ Nightly Reflection")
-        gratitude = st.checkbox("I've thought of 3 things I'm grateful for", value=bool(prefill.get("Gratitude Reflected", False)), key=wkey("gratitude"))
+        gratitude_done = st.checkbox(
+            "I've thought of 3 things I'm grateful for",
+            value=bool(prefill.get("Gratitude Reflected", False)),
+            key=key("gratitude"),
+        )
 
 with tab_journal:
     with st.container(border=True):
@@ -429,22 +574,24 @@ with tab_journal:
         with col1:
             project_hours = st.number_input(
                 "Project hours", min_value=0.0, max_value=24.0, step=0.25,
-                value=float(prefill.get("Project Hours", 0.0) or 0.0), key=wkey("project_hours"),
+                value=float(prefill.get("Project Hours", 0.0) or 0.0),
+                key=key("project_hours"),
             )
         with col2:
             study_hours = st.number_input(
                 "Study / review hours", min_value=0.0, max_value=24.0, step=0.25,
-                value=float(prefill.get("Study/Review Hours", 0.0) or 0.0), key=wkey("study_hours"),
+                value=float(prefill.get("Study/Review Hours", 0.0) or 0.0),
+                key=key("study_hours"),
             )
 
     with st.container(border=True):
         st.markdown("##### 📝 What did you do today?")
-        journal = st.text_area(
+        journal_text = st.text_area(
             "Journal", value=str(prefill.get("Journal", "") or ""), height=110,
             placeholder="Shipped the ingestion retry logic, reviewed two PRs, read a chapter on vector indexing…",
-            label_visibility="collapsed", max_chars=600, key=wkey("journal"),
+            label_visibility="collapsed", max_chars=600, key=key("journal"),
         )
-        st.caption(f"{len(journal)} / 600")
+        st.caption(f"{len(journal_text)} / 600")
 
 with tab_intel:
     with st.container(border=True):
@@ -455,21 +602,65 @@ with tab_intel:
     with st.container(border=True):
         st.markdown("##### 🧠 Today's Lesson")
         st.markdown(f"**{lesson_title}**")
-        st.markdown(f'<div style="font-size:.92rem; line-height:1.65; color:var(--text);">{lesson_body}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="font-size:.92rem; line-height:1.65; color:var(--text);">{lesson_body}</div>',
+            unsafe_allow_html=True,
+        )
+
+# =============================================================================
+# XP, streak, and save — computed after inputs, before the Stats tab renders,
+# so the Stats tab always reflects this run's changes rather than lagging
+# one interaction behind.
+# =============================================================================
+
+xp = sum([workout_done, target_1, target_2, target_3, gratitude_done]) * 20
+tier_label = "Sovereign Sage" if xp >= 100 else "Warrior-Scholar" if xp >= 40 else "The Seeker"
+tier_class = "sage" if xp >= 100 else ""
+
+current_streak, best_streak = compute_streak(existing_df, today_key, xp)
+
+row = {
+    "Date": today_key,
+    "Weekday": today.strftime("%A"),
+    "Workout Split": split_title,
+    "Workout Done": workout_done,
+    "Target 1 - Code/Review": target_1,
+    "Target 2 - Deep Work": target_2,
+    "Target 3 - Water/Nutrition": target_3,
+    "Gratitude Reflected": gratitude_done,
+    "Project Hours": project_hours,
+    "Study/Review Hours": study_hours,
+    "Journal": journal_text,
+    "Daily XP %": xp,
+    "Streak": current_streak,
+}
+
+sync_message = None
+if not row_unchanged_since_last_save(row):
+    try:
+        save_entry(log_path, row)
+        st.session_state["_last_saved_row"] = row
+        sync_message = f"Synced to Excel · {dt.datetime.now().strftime('%H:%M:%S')}"
+        if xp >= 100 and should_celebrate(today_key):
+            st.balloons()
+            st.toast("Perfect day — 100% XP!", icon="🔥")
+    except Exception as exc:
+        with st.sidebar:
+            st.error(f"Auto-save failed: {exc}")
 
 with tab_stats:
-    df_display = load_log(log_path)
-    if df_display.empty:
+    log_df = load_log(log_path)
+    if log_df.empty:
         st.info("No entries yet — your first save will appear here automatically.")
     else:
         with st.container(border=True):
-            total_project = pd.to_numeric(df_display["Project Hours"], errors="coerce").sum()
-            total_study = pd.to_numeric(df_display["Study/Review Hours"], errors="coerce").sum()
+            total_project = pd.to_numeric(log_df["Project Hours"], errors="coerce").sum()
+            total_study = pd.to_numeric(log_df["Study/Review Hours"], errors="coerce").sum()
             cc1, cc2, cc3 = st.columns(3)
-            cc1.metric("Days logged", len(df_display))
+            cc1.metric("Days logged", len(log_df))
             cc2.metric("Project hrs", f"{total_project:.1f}")
             cc3.metric("Study hrs", f"{total_study:.1f}")
-        st.dataframe(df_display.sort_values("Date", ascending=False), width='stretch', hide_index=True)
+        st.dataframe(log_df.sort_values("Date", ascending=False), width="stretch", hide_index=True)
 
     with st.container(border=True):
         st.markdown("##### 🗓 Day Cycle")
@@ -477,58 +668,27 @@ with tab_stats:
             "Each calendar day gets its own row automatically — tomorrow starts blank "
             "with no action needed. Use this only if you want to wipe *today's* entry and start over."
         )
-        if st.button("🗑 Clear today's entry", width='stretch'):
-            st.session_state["_clear_today"] = True
+        if st.button("🗑 Clear today's entry", width="stretch"):
+            request_clear_today()
             st.rerun()
 
-# ---- XP + streak ----
-tokens = [workout_done, t1, t2, t3, gratitude]
-xp = sum(tokens) * 20
-tier_label = "Sovereign Sage" if xp >= 100 else ("Warrior-Scholar" if xp >= 40 else "The Seeker")
-tier_class = "sage" if xp >= 100 else ""
-
-current_streak, best_streak = compute_streak(existing_df, today_key, xp)
+# =============================================================================
+# Sidebar — live XP ring, tier, and streak (rendered last so it reflects
+# this run's freshly computed values)
+# =============================================================================
 
 with st.sidebar:
     st.markdown("---")
     st.markdown(ring_svg(xp), unsafe_allow_html=True)
-    st.markdown(f'<div style="text-align:center;margin-top:8px;"><span class="tier-chip {tier_class}">{tier_label}</span></div>', unsafe_allow_html=True)
-    s1, s2 = st.columns(2)
-    s1.metric("Streak", f"{current_streak}d")
-    s2.metric("Best", f"{best_streak}d")
-
-# ---- Auto-save on every rerun (no button — feels like a live database) ----
-row = {
-    "Date": today_key,
-    "Weekday": today.strftime("%A"),
-    "Workout Split": split_title,
-    "Workout Done": workout_done,
-    "Target 1 - Code/Review": t1,
-    "Target 2 - Deep Work": t2,
-    "Target 3 - Water/Nutrition": t3,
-    "Gratitude Reflected": gratitude,
-    "Project Hours": project_hours,
-    "Study/Review Hours": study_hours,
-    "Journal": journal,
-    "Daily XP %": xp,
-    "Streak": current_streak,
-}
-
-try:
-    save_entry(log_path, row)
-    with st.sidebar:
+    st.markdown(
+        f'<div style="text-align:center;margin-top:8px;"><span class="tier-chip {tier_class}">{tier_label}</span></div>',
+        unsafe_allow_html=True,
+    )
+    side_col1, side_col2 = st.columns(2)
+    side_col1.metric("Streak", f"{current_streak}d")
+    side_col2.metric("Best", f"{best_streak}d")
+    if sync_message:
         st.markdown(
-            f'<div class="sync-badge"><span class="sync-dot"></span>Synced to Excel · {dt.datetime.now().strftime("%H:%M:%S")}</div>',
+            f'<div class="sync-badge"><span class="sync-dot"></span>{sync_message}</div>',
             unsafe_allow_html=True,
         )
-    if xp >= 100 and not st.session_state.get("_celebrated_today") == today_key:
-        st.session_state["_celebrated_today"] = today_key
-        st.balloons()
-        st.toast("Perfect day — 100% XP!", icon="🔥")
-except Exception as e:
-    with st.sidebar:
-        st.error(f"Auto-save failed: {e}")
-
-if st.session_state.get("_force_reset"):
-    st.session_state["_force_reset"] = False
-    st.toast("Day committed. Streak updates on your next perfect day.", icon="✅")
